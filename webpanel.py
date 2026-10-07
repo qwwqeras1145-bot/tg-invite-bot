@@ -463,6 +463,26 @@ body.hasbg{background-image:url('/branding/bg');background-size:cover;
 body.hasbg::before{content:"";position:fixed;inset:0;z-index:0;pointer-events:none;
   background:color-mix(in srgb,var(--bg) 76%,transparent)}
 body.hasbg .app,body.hasbg .login-wrap{position:relative;z-index:1}
+/* 头像裁剪器（QQ/微信式） */
+.cropmask{position:fixed;inset:0;background:rgba(4,8,14,.78);z-index:120;display:none;
+  align-items:center;justify-content:center;padding:20px}
+.cropmask.on{display:flex}
+.cropbox{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:18px;
+  width:min(660px,94vw);box-shadow:0 26px 70px -22px rgba(0,0,0,.7)}
+.cropbox h3{margin:0 0 12px;color:var(--fg);font-size:15px}
+.cropstage{position:relative;height:290px;border-radius:12px;overflow:hidden;background:#05070b;
+  cursor:grab;touch-action:none}
+.cropstage:active{cursor:grabbing}
+.cropstage img{position:absolute;left:0;top:0;transform-origin:0 0;user-select:none;
+  pointer-events:none;max-width:none}
+.cropring{position:absolute;inset:0;margin:auto;width:200px;height:200px;border-radius:50%;
+  border:2px solid rgba(255,255,255,.92);
+  box-shadow:0 0 0 9999px rgba(4,8,14,.58);pointer-events:none}
+.croprow{display:flex;gap:14px;align-items:center;margin-top:14px}
+.croprow input[type=range]{flex:1;accent-color:var(--acc)}
+.croppreview{width:56px;height:56px;border-radius:50%;flex:0 0 auto;overflow:hidden;
+  border:2px solid var(--line);background:#05070b;background-repeat:no-repeat}
+.cropbtns{display:flex;gap:10px;margin-top:14px;justify-content:flex-end}
 """
 
 THEME_BOOT = """<script>(function(){try{
@@ -508,6 +528,9 @@ class WebPanel(threading.Thread):
          "只对新申请生效：Telegram 不会把历史积压的申请推给机器人", False),
         ("auto_approve_tracked", "专属链接申请自动放行",
          "通过机器人专属邀请链接来的申请自动批准，邀请链路不再卡人工审批", False),
+        ("auto_sync_requests", "自动同步申请状态",
+         "每 5 分钟核对一次待处理申请：群聊里已不存在的自动归档，仍存在的按规则拒绝，"
+         "让网页和 Telegram 保持一致（无需手动点「批量复核」）", False),
         ("auto_bind_enabled", "自动绑定新群", "机器人被设为管理员且尚未绑定任何群时自动绑定", False),
         ("cleanup_notify_admin", "清理结果通知管理员", "扫描/移除的结果私聊通知所有管理员", False),
         ("allow_cleanup_kick", "允许清理时踢人", "关闭时任何清理都不会把人移出群；开启后才响应 CONFIRM", True),
@@ -1617,8 +1640,21 @@ class WebPanel(threading.Thread):
             length = int(h.headers.get("Content-Length") or 0)
         except ValueError:
             length = 0
-        raw = h.rfile.read(min(length, 65536)).decode("utf-8", "replace") if length else ""
-        return urllib.parse.parse_qs(raw)
+        # 上限 8MB：LOGO/背景图走 base64 表单字段（2MB 图片 → 约 2.7MB 文本）。
+        # 旧代码 64KB 上限会把大图截断成"只上传一半"。
+        # 循环读到满，防止底层短读/分批到达导致的截断。
+        raw = b""
+        if 0 < length <= 8 * 1024 * 1024:
+            try:
+                h.connection.settimeout(20)
+                while len(raw) < length:
+                    chunk = h.rfile.read(min(65536, length - len(raw)))
+                    if not chunk:
+                        break
+                    raw += chunk
+            except OSError:
+                pass
+        return urllib.parse.parse_qs(raw.decode("utf-8", "replace") if raw else "")
 
     def _resolve_user(self, cookie_header: str | None):
         """返回当前登录身份；未登录返回 None。
@@ -1799,8 +1835,12 @@ class WebPanel(threading.Thread):
             return False
 
     def _emergency_page(self, h, method: str) -> None:
-        """隐藏的应急口令入口：只有知道秘密地址的人能到这里，登录页上没有任何入口。"""
-        if not self._allow_password_login() or not (self.pw_hash or self.password):
+        """隐藏的应急口令入口：只有知道秘密地址的人能到这里，登录页上没有任何入口。
+
+        不受「允许密码登录」总开关限制——应急入口是救命通道，
+        被开关锁死会让所有人（包括管理员自己）进不来。
+        """
+        if not (self.pw_hash or self.password):
             return self._send(h, 404, b"", "text/plain; charset=utf-8")
         if method == "GET":
             body = ('<h2 style="margin:0 0 6px">应急入口</h2>'
@@ -2884,6 +2924,20 @@ class WebPanel(threading.Thread):
             mark = self.db.is_marked_deleted(gid, r["user_id"])
             name = r["user_name"] or f"用户 {r['user_id']}"
             inviter = self._who(r["inviter_id"]) if r["inviter_id"] else "—"
+            # 待处理页：每条申请都能单独「通过 / 拒绝」（对应 Telegram 客户端里的单条操作）
+            acts_cell = ""
+            if tab == "pending":
+                acts_cell = (
+                    f'<td class="n"><div class="row" style="gap:6px;flex-wrap:nowrap">'
+                    f'<form method="post" action="/requests" style="margin:0">{self._ginput()}'
+                    f'<input type="hidden" name="action" value="approve_one">'
+                    f'<input type="hidden" name="user_id" value="{r["user_id"]}">'
+                    f'<button class="btn btn-sm btn-primary" type="submit">通过</button></form>'
+                    f'<form method="post" action="/requests" style="margin:0">{self._ginput()}'
+                    f'<input type="hidden" name="action" value="decline_one">'
+                    f'<input type="hidden" name="user_id" value="{r["user_id"]}">'
+                    f'<button class="btn btn-sm btn-danger" type="submit">拒绝</button></form>'
+                    f'</div></td>')
             trs.append(
                 f'<tr><td><div class="who">{self._avatar_img(r["user_id"], name)}<div style="min-width:0">'
                 f'<div class="nm">{esc(name)}' + (' <span class="badge b-bad">已注销</span>' if mark else "")
@@ -2892,16 +2946,18 @@ class WebPanel(threading.Thread):
                 f'</div></div></div></td>'
                 f'<td class="n">{when}</td><td>{labels.get(r["decision"], r["decision"])}</td>'
                 f'<td class="n">{esc(r["decided_by"] or "—")}</td><td class="muted">{esc(r["reason"] or "")}</td>'
-                f'<td class="muted">{esc(inviter)}</td></tr>')
+                f'<td class="muted">{esc(inviter)}</td>{acts_cell}</tr>')
         empty_html = (
             f'<div class="empty">{icon("check", 40)}<h2 style="margin:8px 0 4px">当前没有待处理申请</h2>'
             f'<p class="muted">和 Telegram 客户端一致。更早的申请都在「全部记录」里（历史留档，可审计）。</p></div>'
             if tab == "pending" and st["pending"] == 0 else
-            f'<tr><td colspan="6"><div class="empty">{icon("inbox", 34)}'
+            f'<tr><td colspan="{7 if tab == "pending" else 6}"><div class="empty">{icon("inbox", 34)}'
             f'<p>还没有入群申请</p></div></td></tr>')
-        table = ('<div class="tablewrap"><table><thead><tr><th>申请者</th><th class="n">申请时间</th>'
-                 '<th>状态</th><th class="n">处理方</th><th>原因</th><th>邀请人</th></tr></thead><tbody>'
-                 + ("".join(trs) or empty_html) + "</tbody></table></div>")
+        head = ('<div class="tablewrap"><table><thead><tr><th>申请者</th><th class="n">申请时间</th>'
+                '<th>状态</th><th class="n">处理方</th><th>原因</th><th>邀请人</th>'
+                + ('<th class="n">操作</th>' if tab == "pending" else "")
+                + '</tr></thead><tbody>')
+        table = (head + ("".join(trs) or empty_html) + "</tbody></table></div>")
         tabs = ['<div class="tabs">']
         for key, label in [("pending", "待处理"), ("all", "全部记录"), ("approved", "已通过"),
                            ("declined", "已拒绝"), ("stale", "已失效")]:
@@ -2944,6 +3000,24 @@ class WebPanel(threading.Thread):
             return self._error(h, 403, "这个群你没有管理权限", "")
         form = self._read_form(h)
         action = (form.get("action") or [""])[0]
+        # 逐条处理：通过 / 拒绝单条申请
+        if action in ("approve_one", "decline_one"):
+            try:
+                uid = int((form.get("user_id") or [""])[0] or 0)
+            except ValueError:
+                uid = 0
+            if not uid:
+                return self._redirect(h, f"/requests?g={gid}")
+            if not self.bot:
+                return self._error(h, 503, "机器人未就绪", "无法执行操作。")
+            res = self.bot.decide_join_request_one(
+                gid, uid, "approve" if action == "approve_one" else "decline",
+                self.current_user().get("uid") or 0)
+            msgs = {"ok": "已通过该申请" if action == "approve_one" else "已拒绝该申请",
+                    "stale": "该申请在 Telegram 侧已不存在，已归档",
+                    "error": "操作失败：Telegram 返回错误，稍后再试"}
+            return self._redirect(h, f"/requests?g={gid}&ok=" +
+                                  urllib.parse.quote(msgs.get(res, str(res))))
         if action not in ("sweep_deleted", "sweep_all"):
             return self._redirect(h, f"/requests?g={gid}")
         if action == "sweep_all" and (form.get("confirm") or [""])[0].strip().upper() != "CONFIRM":
@@ -3236,13 +3310,12 @@ class WebPanel(threading.Thread):
         appearance = (
             '<div class="card pad" style="margin-top:16px"><h2 style="margin:0 0 12px">'
             '🎨 外观（LOGO / 背景图）</h2>'
-            f'<form method="post" action="/settings" class="row">{self._ginput()}'
+            '<form method="post" action="/settings" class="row" id="logoform">{self._ginput()}'
             '<input type="hidden" name="logo_data" id="logo_data" value="">'
             '<input type="file" id="logo_file" accept="image/png,image/jpeg,image/webp" '
-            'style="display:none" onchange="dshRead(this, \'logo_data\')">'
+            'style="display:none" onchange="dshOpenCrop(this.files && this.files[0])">'
             '<button class="btn" type="button" onclick="document.getElementById(\'logo_file\').click()">'
-            + icon("upload", 15) + ' 选择 LOGO</button>'
-            '<button class="btn btn-primary" type="submit">保存 LOGO</button>'
+            + icon("upload", 15) + ' 更换 LOGO（裁剪）</button>'
             '<span class="muted" style="font-size:12px">'
             f'{"当前：已自定义" if self._has_logo() else "当前：默认字母"}</span></form>'
             f'<form method="post" action="/settings" class="row" style="margin-top:10px">{self._ginput()}'
@@ -3257,12 +3330,78 @@ class WebPanel(threading.Thread):
             f'<form method="post" action="/settings" class="row" style="margin-top:10px">{self._ginput()}'
             '<input type="hidden" name="action" value="clear_branding">'
             '<button class="btn btn-danger" type="submit">恢复默认外观</button></form>'
-            '<p class="muted" style="margin:10px 0 0">LOGO 建议正方形 PNG；背景图建议 1920×1080，'
-            '均 ≤2MB。保存后刷新页面（Ctrl+F5）生效。</p></div>'
-            '<script>function dshRead(input,target){var f=input.files&&input.files[0];if(!f)return;'
-            'if(f.size>2*1024*1024){alert("图片不能超过 2MB");return;}'
+            '<p class="muted" style="margin:10px 0 0">LOGO 支持像微信/QQ 一样拖动 + 缩放裁剪；'
+            '背景图建议 1920×1080，均 ≤10MB。保存后刷新页面（Ctrl+F5）生效。</p></div>'
+
+            # ---- 头像裁剪器（QQ/微信式：拖拽 + 缩放 + 圆形预览）----
+            '<div class="cropmask" id="cropmask"><div class="cropbox">'
+            '<h3>✂️ 裁剪 LOGO（拖动图片 / 拖动滑块缩放）</h3>'
+            '<div class="cropstage" id="cropstage"><img id="cropimg" alt=""><div class="cropring"></div></div>'
+            '<div class="croprow">'
+            '<input type="range" id="cropzoom" min="1" max="4" step="0.01" value="1">'
+            '<div class="croppreview" id="croppreview"></div>'
+            '</div>'
+            '<div class="cropbtns">'
+            '<button class="btn" type="button" onclick="dshCropClose()">取消</button>'
+            '<button class="btn btn-primary" type="button" onclick="dshCropCommit()">确定</button>'
+            '</div></div></div>'
+
+            '<script>'
+            'function dshRead(input,target){var f=input.files&&input.files[0];if(!f)return;'
+            'if(f.size>10*1024*1024){alert("图片不能超过 10MB");return;}'
             'var r=new FileReader();r.onload=function(){'
-            'document.getElementById(target).value=r.result;};r.readAsDataURL(f);}</script>')
+            'document.getElementById(target).value=r.result;};r.readAsDataURL(f);}'
+            'var dc={img:new Image(),s:1,x:0,y:0,drag:false,px:0,py:0,cw:200,ch:200};'
+            'function dshEl(id){return document.getElementById(id)}'
+            'dc.img.onload=function(){dc.s=1;dc.x=0;dc.y=0;dshCropFit();dshCropPaint();};'
+            'function dshOpenCrop(f){'
+            ' if(!f)return;'
+            ' if(f.size>10*1024*1024){alert("图片不能超过 10MB");return;}'
+            ' var fr=new FileReader();'
+            ' fr.onload=function(){dc.img.src=fr.result;dshEl("cropmask").classList.add("on");};'
+            ' fr.readAsDataURL(f);}'
+            'function dshCropClose(){dshEl("cropmask").classList.remove("on")}'
+            'function dshCropFit(){'
+            ' var st=dshEl("cropstage"),iw=dc.img.naturalWidth,ih=dc.img.naturalHeight;'
+            ' dc.s=Math.max(dc.cw/iw,dc.ch/ih);'
+            ' dc.x=(st.clientWidth-iw*dc.s)/2;dc.y=(st.clientHeight-ih*dc.s)/2;}'
+            'function dshCropClamp(){'
+            ' var st=dshEl("cropstage"),iw=dc.img.naturalWidth*dc.s,ih=dc.img.naturalHeight*dc.s;'
+            ' var cx=(st.clientWidth-dc.cw)/2,cy=(st.clientHeight-dc.ch)/2;'
+            ' dc.x=Math.min(cx,Math.max(cx-(iw-dc.cw),dc.x));'
+            ' dc.y=Math.min(cy,Math.max(cy-(ih-dc.ch),dc.y));}'
+            'function dshCropPaint(){'
+            ' dshCropClamp();'
+            ' dshEl("cropimg").style.transform="translate("+dc.x+"px,"+dc.y+"px) scale("+dc.s+")";'
+            ' dshCropPreview();}'
+            'function dshCropPreview(){'
+            ' var st=dshEl("cropstage"),cx=(st.clientWidth-dc.cw)/2,cy=(st.clientHeight-dc.ch)/2;'
+            ' var pv=dshEl("croppreview");if(!pv)return;'
+            ' var iw=dc.img.naturalWidth*dc.s,ih=dc.img.naturalHeight*dc.s;'
+            ' var scale=pv.clientWidth/(dc.cw/dc.s);'
+            ' pv.style.backgroundImage="url("+dc.img.src+")";'
+            ' pv.style.backgroundSize=(iw*scale)+"px "+(ih*scale)+"px";'
+            ' pv.style.backgroundPosition=(-(cx-dc.x)*scale)+"px "+(-(cy-dc.y)*scale)+"px";'
+            ' pv.style.backgroundRepeat="no-repeat";}'
+            'function dshCropCommit(){'
+            ' var st=dshEl("cropstage"),cx=(st.clientWidth-dc.cw)/2,cy=(st.clientHeight-dc.ch)/2;'
+            ' var cv=document.createElement("canvas");cv.width=512;cv.height=512;'
+            ' var g=cv.getContext("2d");'
+            ' var sx=(cx-dc.x)/dc.s,sy=(cy-dc.y)/dc.s,sw=dc.cw/dc.s;'
+            ' try{g.drawImage(dc.img,sx,sy,sw,sw,0,0,512,512);}catch(e){}'
+            ' dshEl("logo_data").value=cv.toDataURL("image/png");'
+            ' dshCropClose();'
+            ' document.getElementById("logoform").submit();}'
+            '(function(){'
+            ' var st=dshEl("cropstage"),z=dshEl("cropzoom");'
+            ' st.addEventListener("pointerdown",function(e){dc.drag=true;dc.px=e.clientX;dc.py=e.clientY;'
+            '  st.setPointerCapture&&st.setPointerCapture(e.pointerId);});'
+            ' st.addEventListener("pointermove",function(e){if(!dc.drag)return;'
+            '  dc.x+=e.clientX-dc.px;dc.y+=e.clientY-dc.py;dc.px=e.clientX;dc.py=e.clientY;dshCropPaint();});'
+            ' ["pointerup","pointercancel"].forEach(function(t){st.addEventListener(t,function(){dc.drag=false;})});'
+            ' z.addEventListener("input",function(){dc.s=+z.value;dshCropPaint();});'
+            '})();'
+            '</script>')
         danger = ('<div class="card pad" style="margin-top:16px"><h2 style="margin:0 0 10px">危险操作</h2>'
                   f'<div class="row"><a class="btn btn-danger" href="/deleted{self._q()}">' + icon("broom", 16) +
                   ' 已注销账号清理</a><a class="btn" href="/logs">' + icon("file", 16) +

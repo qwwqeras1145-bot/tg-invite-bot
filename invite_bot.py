@@ -128,6 +128,7 @@ DEFAULT_CONFIG = {
     "auto_decline_deleted": True,
     "auto_decline_all_new": False,
     "auto_approve_tracked": False,
+    "auto_sync_requests": True,
     "auto_bind_enabled": True,
     "cleanup_notify_admin": True,
     "allow_cleanup_kick": False,
@@ -1723,6 +1724,19 @@ class InviteBot:
                 log(f"禁漫自动清理：删除了 {n} 本过期下载")
         except Exception:
             pass
+        # 自动同步入群申请：每 5 分钟核对一次"待处理"，
+        # Telegram 里已不存在的申请自动归档，仍存在的按规则拒绝 —— 网页和群聊保持一致
+        # （独立于备份开关，避免被提前 return 跳过）
+        if self.setting("auto_sync_requests", True):
+            try:
+                last = int(self.db.get_kv("last_sync_req") or 0)
+            except (TypeError, ValueError):
+                last = 0
+            if now - last >= 300:
+                self.db.set_kv("last_sync_req", str(now))
+                for ch in self.db.active_chats():
+                    if self.db.join_requests_stats(ch["chat_id"])["pending"]:
+                        self.submit(self.sweep_join_requests, ch["chat_id"], "all", None)
         if not self.setting("auto_backup_enabled", True):
             return
         today = time.strftime("%Y-%m-%d", time.localtime(now))
@@ -3838,6 +3852,29 @@ class InviteBot:
         log(f"申请复核完成：检查 {checked}，拒绝 {declined}，归档失效 {stale}，保留 {kept}，失败 {failed}")
         return {"checked": checked, "declined": declined, "kept": kept,
                 "failed": failed, "stale": stale}
+
+    def decide_join_request_one(self, gid: int, uid: int, action: str, actor_id=None) -> str:
+        """网页逐条处理入群申请：action = 'approve' / 'decline'。
+
+        返回 'ok'（已处理）/ 'stale'（Telegram 侧已不存在，本地归档）/ 'error'。
+        """
+        method = "approveChatJoinRequest" if action == "approve" else "declineChatJoinRequest"
+        try:
+            self.tg.call(method, {"chat_id": gid, "user_id": uid}, retries=1)
+        except TelegramError as e:
+            if "HIDE_REQUESTER_MISSING" in str(e) or "user is deactivated" in str(e):
+                self.db.decide_join_request(gid, uid, "stale", "manual",
+                                            "Telegram 侧已不存在该申请")
+                return "stale"
+            log(f"逐条处理申请失败：{uid} {e}", "WARN")
+            return "error"
+        decision = "approved" if action == "approve" else "declined"
+        self.db.decide_join_request(gid, uid, decision, "manual",
+                                    "管理员网页逐条通过" if action == "approve" else "管理员网页逐条拒绝")
+        self.db.record_audit(actor_id, None, "decide_one", target=str(uid), chat_id=gid,
+                             detail=f"网页逐条{decision}入群申请")
+        log(f"网页逐条处理入群申请：{uid} -> {decision}")
+        return "ok"
 
     # -- 入群申请（群开启了"管理员审批"时） --------------------------------
     def on_join_request(self, req: dict) -> None:

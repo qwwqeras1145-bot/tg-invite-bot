@@ -42,7 +42,7 @@ import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 BOT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG_PATH = os.path.join(BOT_DIR, "config.json")
 

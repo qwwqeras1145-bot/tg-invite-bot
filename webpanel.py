@@ -80,7 +80,7 @@ except Exception:  # pragma: no cover
 
     PBKDF2_ITER = 600_000
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 SESSION_COOKIE = "dshb_sess"
 TWOFA_COOKIE = "dshb_2fa"
 SESSION_TTL = 12 * 3600          # 会话 12 小时过期（原来 7 天，缩短以降低被盗用风险）

@@ -24,6 +24,7 @@ import csv
 import json
 import os
 import re
+import secrets
 import ssl
 import threading
 import time
@@ -80,7 +81,7 @@ except Exception:  # pragma: no cover
 
     PBKDF2_ITER = 600_000
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 SESSION_COOKIE = "dshb_sess"
 TWOFA_COOKIE = "dshb_2fa"
 SESSION_TTL = 12 * 3600          # 会话 12 小时过期（原来 7 天，缩短以降低被盗用风险）
@@ -551,6 +552,7 @@ class WebPanel(threading.Thread):
         self.log = log_fn
         self._server: ThreadingHTTPServer | None = None
         self._login_tries: dict[str, list] = {}
+        self._sni_seen: dict = {}
         self._tunnel_cache: tuple | None = None
         secret = db.get_kv("web_secret")
         if not secret:
@@ -763,17 +765,25 @@ class WebPanel(threading.Thread):
         return hosts
 
     def _sni_callback(self, sock, server_name, ctx):
-        """SNI 必须命中白名单，**空 SNI 也拒绝**。
+        """识别 SNI 但**不在这里抛异常**。
 
-        这样"拿 IP 直连"的人连 TLS 握手都过不去，扫不到任何东西。
-        本机自检请用带 SNI 的方式：
-            curl --resolve bot.example.com:443:127.0.0.1 https://bot.example.com/healthz
+        历史上这里 raise ssl.SSLError 来拒绝陌生 SNI，结果 Python 的 ssl 模块会把每次
+        拒绝都打成 "Exception ignored in: ..." 的 traceback（几小时就刷几百条，看着像崩了）。
+        真正的拦截在 HTTP 层：Host 头不在白名单一律返回 421，效果一样、日志干净。
+        这里只做节流记录，方便排查谁在扫。
         """
         name = (server_name or "").strip().lower()
         if name and name in self.allowed_hosts:
             return
-        self.log(f"拒绝 SNI 不在白名单的 TLS 连接：{name or '(空/直接拿 IP 连)'}", "WARN")
-        raise ssl.SSLError(f"unknown server name: {name or 'none'}")
+        try:
+            now = time.time()
+            key = name or "(空)"
+            last = self._sni_seen.get(key, 0)
+            if now - last > 600:                     # 同一来源 10 分钟最多记一次
+                self._sni_seen[key] = now
+                self.log(f"收到非白名单 SNI：{name or '(空/直接拿 IP 连)'}（HTTP 层将返回 421）")
+        except Exception:
+            pass
 
     def run(self) -> None:
         handler = _make_handler(self)
@@ -785,6 +795,7 @@ class WebPanel(threading.Thread):
         self._server.daemon_threads = True
         self.ready = True
         self.allowed_hosts = self._allowed_hosts()
+        self._sni_seen: dict = {}
         cert, key = self.cfg.get("web_tls_cert"), self.cfg.get("web_tls_key")
         if cert and key and os.path.exists(cert) and os.path.exists(key):
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -1246,6 +1257,10 @@ class WebPanel(threading.Thread):
                 return self._login_start(h)
             if path == "/login/poll":
                 return self._login_poll(h, qs)
+            if path == "/login/code":
+                if method != "POST":
+                    return self._redirect(h, "/login")
+                return self._login_code(h)
             if self.emergency_path and path == self.emergency_path:
                 return self._emergency_page(h, method)
             if path == "/login/2fa":
@@ -1290,7 +1305,8 @@ class WebPanel(threading.Thread):
                 return self._twofa_page(h)
             if path in ("/me/2fa/on", "/me/2fa/off", "/me/2fa/newbackup"):
                 return self._post_twofa(h, path)
-            if path in ("/me/pw", "/me/tg", "/me/linkreq"):
+            if path in ("/me/pw", "/me/pw-init", "/me/tg", "/me/linkreq",
+                        "/me/username", "/me/email"):
                 return self._post_me(h, path)
 
             # ---- 需要群权限的页面 ----
@@ -1904,12 +1920,23 @@ class WebPanel(threading.Thread):
     def _login(self, h, method: str, qs) -> None:
         """GET 显示登录页；POST 处理 用户名/邮箱 + 密码 登录。"""
         mode = (qs.get("m") or ["tg"])[0]
+        err_map = {
+            "code": "确认码不正确或已过期。请在 Telegram 机器人回复里找最新的 6 位码（有效期 15 分钟）。",
+            "closed": "站点已关闭新账号注册，请联系管理员。",
+            "disabled": "这个账号已被管理员禁用。",
+            "expired": "登录凭证已过期，请重新发起登录。",
+            "wait": "还没有收到 Telegram 的确认。请先在 Telegram 里给机器人发送 /start，然后重试。",
+            "create": "账号创建失败，请稍后重试或联系管理员。",
+            "toomany": "尝试次数过多，请 15 分钟后再试。",
+        }
+        err_key = (qs.get("err") or [""])[0]
+        page_err = err_map.get(err_key)
         if method == "GET":
             if mode == "pw":
                 return self._password_form(h, "用户名 / 密码", "username", "/login?m=pw")
             if mode == "em":
                 return self._password_form(h, "邮箱 / 密码", "email", "/login?m=em")
-            return self._login_page(h, None)
+            return self._login_page(h, page_err)
         form = self._read_form(h)
         ident = (form.get("ident") or [""])[0].strip()
         pwd = (form.get("password") or [""])[0]
@@ -1987,7 +2014,13 @@ class WebPanel(threading.Thread):
         if not nxt.startswith("/"):
             nxt = "/"
         nonce = uuid.uuid4().hex[:24]
-        self.db.create_login_nonce(nonce)
+        # 6 位确认码：跨设备兜底（手机上确认，电脑上输码），不依赖 fetch/Set-Cookie
+        code = f"{secrets.randbelow(1000000):06d}"
+        try:
+            self.db.create_login_nonce(nonce, code=code)
+        except TypeError:                      # 老版本 Storage 兼容
+            self.db.create_login_nonce(nonce)
+            code = ""
         uname = ""
         try:
             uname = self.bot.bot_username if self.bot else ""
@@ -1998,61 +2031,113 @@ class WebPanel(threading.Thread):
         qr = ""
         try:
             import qrgen
-            qr = f'<div class="qr" style="margin:14px auto;display:block;width:max-content">{qrgen.svg(deep, scale=4, border=2)}</div>'
+            qr = (f'<div class="qr" style="margin:14px auto;display:block;width:max-content">'
+                  f'{qrgen.svg(deep, scale=4, border=2)}</div>')
         except Exception:
             qr = ""
         body = (f'<h2 style="margin:0 0 6px">用 Telegram 确认登录</h2>'
                 f'<p class="muted" style="margin:0 0 14px">1）点下面的按钮打开 Telegram<br>'
-                f'2）给机器人发送 <code>/start</code><br>3）这里会自动完成登录</p>'
+                f'2）给机器人发送 <code>/start</code><br>3）这里会自动进入；'
+                f'没反应就用下面两种方式之一</p>'
                 f'<a class="btn btn-primary" href="{esc(deep)}" target="_blank" rel="noopener" '
                 f'style="width:100%;justify-content:center">{icon("bolt", 16)} 打开 Telegram 确认</a>'
                 f'{qr}'
                 f'<p class="muted mono" style="font-size:11px;word-break:break-all">{esc(deep)}</p>'
                 f'<p id="st" class="muted">⏳ 等待你在 Telegram 里确认…</p>'
-                f'<script>var n="{nonce}";setInterval(function(){{'
-                f'fetch("/login/poll?n="+n).then(function(r){{return r.json()}}).then(function(d){{'
-                f'if(d.ok){{document.getElementById("st").textContent="✅ 登录成功，正在跳转…";'
-                f'location.href="{esc(nxt)}";}}else if(d.expired){{'
-                f'document.getElementById("st").textContent="⌛️ 已过期，请重新发起登录";}}}});'
-                f'}},2000);</script>')
+                f'<div style="margin:10px 0 6px">'
+                f'<button class="btn" type="button" style="width:100%;justify-content:center" '
+                f'onclick="location.href=\'/login/poll?go=1&n={nonce}\'">'
+                f'我已经在 Telegram 确认了 · 立即进入</button></div>'
+                f'<div class="card pad" style="margin-top:12px">'
+                f'<p class="muted" style="margin:0 0 8px">手机上确认的？把 Telegram 机器人回复里的 '
+                f'<b>6 位确认码</b>填到这里：</p>'
+                f'<form method="post" action="/login/code" class="row">'
+                f'<input type="hidden" name="next" value="{esc(nxt)}">'
+                f'<div style="max-width:160px;flex:1"><input type="text" name="code" inputmode="numeric" '
+                f'maxlength="6" placeholder="6 位确认码" autocomplete="one-time-code"></div>'
+                f'<button class="btn btn-primary" type="submit">提交</button></form></div>'
+                f'<script>var n="{nonce}";var tm=setInterval(function(){{'
+                f'fetch("/login/poll?n="+n,{{cache:"no-store",credentials:"same-origin"}})'
+                f'.then(function(r){{return r.json()}}).then(function(d){{'
+                f'if(d.ok){{clearInterval(tm);'
+                f'document.getElementById("st").textContent="✅ 登录成功，正在跳转…";'
+                f'location.href="{esc(nxt)}";}}else if(d.expired){{clearInterval(tm);'
+                f'document.getElementById("st").textContent="⌛️ 已过期，请重新发起登录";}}}})'
+                f'.catch(function(){{}});}},2000);</script>')
         self._html(h, 200, self._login_shell("Telegram 登录", body))
 
-    def _login_poll(self, h, qs) -> None:
-        nonce = (qs.get("n") or [""])[0]
-        row = self.db.get_login_nonce(nonce) if nonce else None
-        if not row:
-            return self._json(h, {"ok": False, "expired": True})
-        if not row["used_at"]:
-            return self._json(h, {"ok": False, "expired": False})
-        uid = row["user_id"]
+    def _grant_session_for_tg(self, h, uid: int, first_name: str, go: bool, nxt: str = "/"):
+        """根据 Telegram uid 找到/创建账号并签发网页会话。
+
+        go=True  ：302 跳转（顶层导航，Set-Cookie 一定生效，跨设备兜底路径）
+        go=False ：返回 JSON（页面轮询路径）
+        """
         acc = self.db.get_account_by_tg(uid)
         if not acc:
             if not self._registration_open():
-                return self._json(h, {"ok": False, "expired": False,
-                                      "error": "closed"})
+                return (self._redirect(h, "/login?err=closed") if go else
+                        self._json(h, {"ok": False, "expired": False, "error": "closed"}))
             try:
-                acc = None
-                acc_id = self.db.create_account(tg_user_id=uid, display_name=row["first_name"],
-                                                role="owner" if self.db.account_count() == 0 else "member")
+                acc_id = self.db.create_account(
+                    tg_user_id=uid, display_name=first_name,
+                    role="owner" if self.db.account_count() == 0 else "member")
                 acc = self.db.get_account(acc_id)
-                self.db.record_audit(uid, row["first_name"], "account_create",
+                self.db.record_audit(uid, first_name, "account_create",
                                      target=str(acc_id), detail="Telegram 首次登录自动建号")
             except ValueError:
                 acc = self.db.get_account_by_tg(uid)
             if not acc:
-                return self._json(h, {"ok": False, "expired": False, "error": "create_failed"})
+                return (self._redirect(h, "/login?err=create") if go else
+                        self._json(h, {"ok": False, "expired": False, "error": "create_failed"}))
         if acc["status"] != "active":
-            return self._json(h, {"ok": False, "expired": False, "error": "disabled"})
-        self.db.touch_login(acc["id"], h.client_address[0] if h.client_address else "-")
+            return (self._redirect(h, "/login?err=disabled") if go else
+                    self._json(h, {"ok": False, "expired": False, "error": "disabled"}))
+        ip = h.client_address[0] if h.client_address else "-"
+        self.db.touch_login(acc["id"], ip)
         self.db.record_audit(uid, acc["display_name"], "web_login_ok", target="telegram",
                              detail=f"账号 #{acc['id']} Telegram 登录")
         self.log(f"Telegram 登录成功：uid={uid} 账号 #{acc['id']}")
-        self._alert_login(uid, h.client_address[0] if h.client_address else "-",
-                          h.headers.get("User-Agent") or "")
+        self._alert_login(uid, ip, h.headers.get("User-Agent") or "")
+        cookie = (f"{SESSION_COOKIE}={self.account_cookie(acc)}; Path=/; "
+                  f"Max-Age={SESSION_TTL}; HttpOnly; SameSite=Lax")
+        if go:
+            return self._send(h, 302, b"", "text/html; charset=utf-8",
+                              extra=[("Set-Cookie", cookie), ("Location", nxt)])
         return self._send(h, 200, b'{"ok":true}', "application/json; charset=utf-8",
-                          extra=[("Set-Cookie",
-                                  f"{SESSION_COOKIE}={self.account_cookie(acc)}; Path=/; "
-                                  f"Max-Age={SESSION_TTL}; HttpOnly; SameSite=Lax")])
+                          extra=[("Set-Cookie", cookie)])
+
+    def _login_code(self, h) -> None:
+        """确认码登录：顶层表单提交，Set-Cookie 必定生效（跨设备兜底）。"""
+        form = self._read_form(h)
+        code = (form.get("code") or [""])[0].strip()
+        nxt = (form.get("next") or ["/"])[0]
+        if not nxt.startswith("/"):
+            nxt = "/"
+        ip = h.client_address[0] if h.client_address else "-"
+        if self.db.count_attempts("login_code", ip, 900) >= 20:
+            return self._redirect(h, "/login?err=toomany")
+        row = self.db.get_login_nonce_by_code(code)
+        if not row or not row["used_at"] or not row["user_id"]:
+            self.db.note_attempt("login_code", ip)
+            self.db.record_audit(None, "web", "web_login_fail", target=ip,
+                                 detail=f"确认码错误 {code[:6]}")
+            self.log(f"确认码登录失败（{code[:6]}）from {ip}", "WARN")
+            return self._redirect(h, "/login?err=code")
+        return self._grant_session_for_tg(h, int(row["user_id"]), row["first_name"] or "",
+                                          go=True, nxt=nxt)
+
+    def _login_poll(self, h, qs) -> None:
+        nonce = (qs.get("n") or [""])[0]
+        go = (qs.get("go") or [""])[0] in ("1", "true", "yes")
+        row = self.db.get_login_nonce(nonce) if nonce else None
+        if not row:
+            return (self._redirect(h, "/login?err=expired") if go else
+                    self._json(h, {"ok": False, "expired": True}))
+        if not row["used_at"]:
+            return (self._redirect(h, "/login?err=wait") if go else
+                    self._json(h, {"ok": False, "expired": False}))
+        return self._grant_session_for_tg(h, int(row["user_id"]), row["first_name"] or "",
+                                          go=go)
 
     def _json(self, h, obj: dict) -> None:
         self._send(h, 200, json.dumps(obj, ensure_ascii=False).encode("utf-8"),
@@ -2214,14 +2299,42 @@ class WebPanel(threading.Thread):
                     f'<div class="item">上次登录 <span class="t">'
                     f'{time.strftime("%Y-%m-%d %H:%M", time.localtime(acc["last_login"])) if acc["last_login"] else "—"}'
                     f' · {esc(acc["last_ip"] or "")}</span></div></div></div>')
-            pw_form = (f'<div class="card pad" style="margin-top:16px"><h2 style="margin:0 0 12px">改密码</h2>'
-                       f'<form method="post" action="/me/pw" class="row">{self._ginput()}'
-                       f'<div style="flex:1;min-width:160px"><input type="password" name="old" '
-                       f'placeholder="当前密码"></div>'
-                       f'<div style="flex:1;min-width:160px"><input type="password" name="new" '
-                       f'placeholder="新密码（至少 8 位）"></div>'
-                       f'<button class="btn btn-primary" type="submit">保存</button></form>'
-                       f'<p class="muted" style="margin:10px 0 0">改完密码后，其他设备会被强制退出。</p></div>')
+            pw_form = (f'<div class="card pad" style="margin-top:16px"><h2 style="margin:0 0 12px">'
+                       f'{"改密码" if acc["pw_hash"] else "设置密码"}</h2>'
+                       + (f'<form method="post" action="/me/pw" class="row">{self._ginput()}'
+                          f'<div style="flex:1;min-width:160px"><input type="password" name="old" '
+                          f'placeholder="当前密码"></div>'
+                          f'<div style="flex:1;min-width:160px"><input type="password" name="new" '
+                          f'placeholder="新密码（至少 8 位）"></div>'
+                          f'<button class="btn btn-primary" type="submit">保存</button></form>'
+                          if acc["pw_hash"] else
+                          f'<form method="post" action="/me/pw-init" class="row">{self._ginput()}'
+                          f'<div style="flex:1;min-width:180px"><input type="password" name="new" '
+                          f'placeholder="新密码（至少 8 位）"></div>'
+                          f'<button class="btn btn-primary" type="submit">设置密码</button></form>'
+                          f'<p class="muted" style="margin:10px 0 0">你还没设过密码，直接设一个即可'
+                          f'——以后不依赖 Telegram 也能用「用户名 + 密码」登录。</p>')
+                       + (f'<p class="muted" style="margin:10px 0 0">改完密码后，其他设备会被强制退出。</p>'
+                          if acc["pw_hash"] else "")
+                       + '</div>')
+            login_card = (
+                f'<div class="card pad" style="margin-top:16px"><h2 style="margin:0 0 12px">'
+                f'🔑 登录方式 / 账号绑定</h2>'
+                f'<p class="muted" style="margin:0 0 14px">给这个账号加上「用户名」和「邮箱」，'
+                f'之后不依赖 Telegram 也能登录（邮箱用于找回密码）。</p>'
+                f'<form method="post" action="/me/username" class="row">{self._ginput()}'
+                f'<div style="flex:1;min-width:190px"><input type="text" name="username" '
+                f'placeholder="用户名（3-20 位字母/数字/下划线）" value="{esc(acc["username"] or "")}" '
+                f'autocomplete="username"></div>'
+                f'<button class="btn btn-primary" type="submit">保存用户名</button></form>'
+                f'<form method="post" action="/me/email" class="row" style="margin-top:10px">{self._ginput()}'
+                f'<div style="flex:1;min-width:190px"><input type="text" name="email" '
+                f'placeholder="绑定邮箱（留空则解绑）" value="{esc(acc["email"] or "")}" '
+                f'autocomplete="email"></div>'
+                f'<button class="btn btn-primary" type="submit">保存邮箱</button></form>'
+                f'<p class="muted" style="margin:10px 0 0">'
+                f'{"邮箱服务未配置，绑定后无法收验证邮件（不影响登录，只影响找回密码）。" if not self.smtp_ready() else "邮箱用于找回密码与安全提醒。"}'
+                f'</p></div>')
             tg_form = (f'<div class="card pad" style="margin-top:16px"><h2 style="margin:0 0 12px">Telegram</h2>'
                        + (f'<form method="post" action="/me/tg" class="row">{self._ginput()}'
                           f'<button class="btn" type="submit">{icon("bolt", 15)} 重新绑定 / 解绑</button>'
@@ -2234,7 +2347,7 @@ class WebPanel(threading.Thread):
         else:
             info = (f'<div class="card pad muted">当前是应急口令登录（无独立账号）。'
                     f'建议 <a href="/register">注册一个账号</a> 并绑定 Telegram。</div>')
-            pw_form = tg_form = ""
+            pw_form = tg_form = login_card = ""
 
         stats = self._me_stats()
         twofa = ""
@@ -2256,7 +2369,7 @@ class WebPanel(threading.Thread):
                      f'（用 Telegram 登录不受影响）</p>'
                      f'<a class="btn {"btn-danger" if on else "btn-primary"}" href="/me/2fa">'
                      f'{"管理两步验证" if on else "立即开启"}</a></div>')
-        body = head + info + stats + pw_form + tg_form + twofa
+        body = head + info + stats + login_card + pw_form + tg_form + twofa
         self._html(h, 200, self._shell("me", "我的", f"{u['name']} · {u['role']}", body))
 
     def _me_stats(self) -> str:
@@ -2327,6 +2440,60 @@ class WebPanel(threading.Thread):
         if not acc:
             return self._error(h, 403, "应急口令登录无法修改资料", "请先注册独立账号。")
         form = self._read_form(h)
+        if path == "/me/pw-init":
+            # 用 Telegram 登录进来的账号还没设过密码 → 免旧密码直接设置
+            if acc["pw_hash"]:
+                return self._redirect(h, "/me?ok=" + urllib.parse.quote(
+                    "已有密码，请用「改密码」修改"))
+            new = (form.get("new") or [""])[0]
+            if len(new) < 8:
+                return self._redirect(h, "/me?ok=" + urllib.parse.quote("新密码至少 8 位"))
+            self.db.set_password(acc["id"], new)
+            self.db.record_audit(acc["tg_user_id"], acc["display_name"], "password_set",
+                                 target=str(acc["id"]), detail="Telegram 登录后自助设置密码")
+            self.log(f"账号 #{acc['id']} 自助设置密码")
+            return self._redirect(h, "/me?ok=" + urllib.parse.quote(
+                "密码已设置，现在可以用「用户名 / 密码」登录了"))
+        if path == "/me/username":
+            uname = (form.get("username") or [""])[0].strip()
+            if uname and not re.match(r"^[A-Za-z0-9_]{3,20}$", uname):
+                return self._redirect(h, "/me?ok=" + urllib.parse.quote(
+                    "用户名只能是 3-20 位字母、数字或下划线"))
+            try:
+                self.db.set_username(acc["id"], uname or None)
+            except ValueError as e:
+                return self._redirect(h, "/me?ok=" + urllib.parse.quote(str(e)))
+            self.db.record_audit(acc["tg_user_id"], acc["display_name"], "username_set",
+                                 target=str(acc["id"]), detail=f"用户名={uname or '（清空）'}")
+            return self._redirect(h, "/me?ok=" + urllib.parse.quote(
+                f"用户名已保存：{uname}" if uname else "已解除用户名绑定"))
+        if path == "/me/email":
+            email = (form.get("email") or [""])[0].strip()
+            if email and not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
+                return self._redirect(h, "/me?ok=" + urllib.parse.quote("邮箱格式不正确"))
+            try:
+                self.db.set_email(acc["id"], email or None, verified=0)
+            except ValueError as e:
+                return self._redirect(h, "/me?ok=" + urllib.parse.quote(str(e)))
+            self.db.record_audit(acc["tg_user_id"], acc["display_name"], "email_set",
+                                 target=str(acc["id"]), detail=f"邮箱={email or '（解绑）'}")
+            if not email:
+                return self._redirect(h, "/me?ok=" + urllib.parse.quote("已解除邮箱绑定"))
+            # 配了邮件服务就发验证邮件（与注册流程同一套令牌）
+            if self.smtp_ready():
+                try:
+                    token = self.db.create_email_token(acc["id"], "verify")
+                    link = f"{self.base_url}/verify?t={token}"
+                    self.send_mail(email, "验证你的邮箱",
+                                   f"点击链接完成验证：\n{link}\n\n如果不是你操作，请忽略。")
+                    return self._redirect(h, "/me?ok=" + urllib.parse.quote(
+                        "邮箱已保存，验证邮件已发送"))
+                except Exception as e:
+                    self.log(f"验证邮件发送失败：{e}", "WARN")
+                    return self._redirect(h, "/me?ok=" + urllib.parse.quote(
+                        "邮箱已保存（验证邮件发送失败，可稍后重试）"))
+            return self._redirect(h, "/me?ok=" + urllib.parse.quote(
+                "邮箱已保存（未配置邮件服务，暂不发送验证邮件）"))
         if path == "/me/pw":
             old = (form.get("old") or [""])[0]
             new = (form.get("new") or [""])[0]

@@ -42,7 +42,7 @@ import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 BOT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG_PATH = os.path.join(BOT_DIR, "config.json")
 
@@ -442,7 +442,8 @@ CREATE TABLE IF NOT EXISTS login_nonces (
     used_at    INTEGER,
     user_id    INTEGER,
     first_name TEXT,
-    username   TEXT
+    username   TEXT,
+    code       TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_nonce_created ON login_nonces(created_at);
 -- 群管理员权限缓存（网页分权用：群管理员只能看自己所在的群）
@@ -561,6 +562,11 @@ class Storage:
             conn.execute("ALTER TABLE accounts ADD COLUMN totp_secret TEXT")
             conn.execute("ALTER TABLE accounts ADD COLUMN totp_enabled INTEGER DEFAULT 0")
             conn.execute("ALTER TABLE accounts ADD COLUMN totp_backup TEXT")
+        ncols = {r["name"] for r in conn.execute("PRAGMA table_info(login_nonces)")}
+        if "code" not in ncols:
+            # 跨设备登录兜底：Telegram 里显示的 6 位确认码
+            conn.execute("ALTER TABLE login_nonces ADD COLUMN code TEXT")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_nonce_code ON login_nonces(code)")
 
     def _next_seq(self) -> int:
         row = self.conn.execute("SELECT COALESCE(MAX(seq), 0) AS m FROM chats").fetchone()
@@ -865,6 +871,31 @@ class Storage:
         self.conn.execute("UPDATE accounts SET role=? WHERE id=?", (role, acc_id))
         self.conn.commit()
 
+    def set_username(self, acc_id: int, username: str | None) -> None:
+        """设置/更换用户名（供已登录用户自助绑定用户名密码登录）。"""
+        username = (username or "").strip() or None
+        if username:
+            other = self.get_account_by_username(username)
+            if other and other["id"] != acc_id:
+                raise ValueError("用户名已被占用")
+        self.conn.execute("UPDATE accounts SET username=? WHERE id=?", (username, acc_id))
+        self.conn.commit()
+
+    def set_email(self, acc_id: int, email: str | None, verified: int = 0) -> None:
+        """绑定/更换邮箱（未验证邮箱不能用于找回密码）。"""
+        email = (email or "").strip() or None
+        if email:
+            other = self.get_account_by_email(email)
+            if other and other["id"] != acc_id:
+                raise ValueError("这个邮箱已被其他账号使用")
+        self.conn.execute("UPDATE accounts SET email=?, email_verified=? WHERE id=?",
+                          (email, 1 if verified else 0, acc_id))
+        self.conn.commit()
+
+    def has_password(self, acc_id: int) -> bool:
+        row = self.get_account(acc_id)
+        return bool(row and row["pw_hash"])
+
     # -- 二次验证（TOTP） ---------------------------------------------------
     def set_totp(self, acc_id: int, secret: str | None, enabled: bool,
                  backup_json: str | None = None) -> None:
@@ -988,15 +1019,28 @@ class Storage:
             (kind, key, int(time.time()) - window)).fetchone()["c"]
 
     # -- 网页登录凭证 / 群权限缓存 ------------------------------------------
-    def create_login_nonce(self, nonce: str, ttl: int = 900) -> None:
+    def create_login_nonce(self, nonce: str, ttl: int = 900, code: str | None = None) -> None:
         now = int(time.time())
         self.conn.execute("DELETE FROM login_nonces WHERE created_at < ?", (now - 86400,))
-        self.conn.execute("INSERT OR REPLACE INTO login_nonces(nonce, created_at) VALUES(?,?)",
-                          (nonce, now))
+        self.conn.execute(
+            "INSERT OR REPLACE INTO login_nonces(nonce, created_at, code) VALUES(?,?,?)",
+            (nonce, now, code))
         self.conn.commit()
 
     def get_login_nonce(self, nonce: str, ttl: int = 900):
         row = self.conn.execute("SELECT * FROM login_nonces WHERE nonce=?", (nonce,)).fetchone()
+        if not row or int(time.time()) - row["created_at"] > ttl:
+            return None
+        return row
+
+    def get_login_nonce_by_code(self, code: str, ttl: int = 900):
+        """按 6 位确认码取最新一条已确认的登录凭证（跨设备兜底登录用）。"""
+        code = (code or "").strip()
+        if not code:
+            return None
+        row = self.conn.execute(
+            """SELECT * FROM login_nonces WHERE code=? AND used_at IS NOT NULL
+               ORDER BY created_at DESC LIMIT 1""", (code,)).fetchone()
         if not row or int(time.time()) - row["created_at"] > ttl:
             return None
         return row
@@ -2526,9 +2570,23 @@ class InviteBot:
         self.audit(user, "web_login_confirm", target=str(user["id"]),
                    detail="Telegram 确认网页登录")
         log(f"网页登录已由 Telegram 用户 {user['id']} 确认")
-        self.tg.send_message(chat_id, (
-            "✅ <b>登录已确认</b>\n\n请回到浏览器，页面会自动进入（这个链接只能用一次）。\n\n"
-            "<i>如果不是你本人操作，请忽略——别人拿不到你的 Telegram 就登不进去。</i>"))
+        code = ""
+        try:
+            row = self.db.get_login_nonce(nonce)
+            code = (row["code"] if row and "code" in row.keys() else "") or ""
+        except Exception:
+            code = ""
+        if code:
+            self.tg.send_message(chat_id, (
+                "✅ <b>登录已确认</b>\n\n"
+                f"网页确认码：<code>{code}</code>\n\n"
+                "回到浏览器：页面会自动进入；如果没反应，就把上面这个 6 位码填进「确认码」框点提交。\n\n"
+                "<i>不是你本人操作就忽略——别人拿不到你的 Telegram 就登不进去。</i>"))
+        else:
+            self.tg.send_message(chat_id, (
+                "✅ <b>登录已确认</b>\n\n请回到浏览器，页面会自动进入"
+                "（没反应就点页面上的「我已确认」按钮）。\n\n"
+                "<i>如果不是你本人操作，请忽略——别人拿不到你的 Telegram 就登不进去。</i>"))
 
     def bind_web_account(self, msg: dict, nonce: str) -> None:
         user = msg["from"]

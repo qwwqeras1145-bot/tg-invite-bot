@@ -394,6 +394,31 @@ def main() -> int:
         check(len(cands) > 0, f"候选名单不再为空（{len(cands)} 人）")
         check(987654321 in cands, "机器人见过的用户已纳入扫描范围")
 
+        # 18) 未绑定群 + 关闭自动绑定：/bind 必须仍然可用（回归：以前整个群的消息被丢弃）
+        print("18) 第二个群手动绑定")
+        NEW_GID = -1007770001111
+        bot.db.set_setting("auto_bind_enabled", False)
+        admin_uid = sorted(bot.db.admins())[0] if hasattr(bot.db, "admins") else 111
+        # 保证操作者确实是机器人管理员
+        bot.db.touch_user({"id": admin_uid, "first_name": "Boss", "username": None}, is_admin=True)
+        gmsg = {"chat": {"id": NEW_GID, "type": "supergroup", "title": "第二个群"},
+                "from": {"id": admin_uid, "first_name": "Boss"}, "message_id": 900,
+                "text": "/bind"}
+        bot.on_message(gmsg)
+        check(bot.chat_is_bound(NEW_GID), "未绑定群发 /bind 成功绑定（自动绑定关着也能绑）")
+        # 群里普通聊天不该把未绑定的群自动绑上（自动绑定确实是关的）
+        OTHER_GID = -1007770002222
+        bot.on_message({"chat": {"id": OTHER_GID, "type": "supergroup", "title": "第三个群"},
+                        "from": {"id": 555000, "first_name": "路人"}, "message_id": 901,
+                        "text": "随便聊两句"})
+        check(not bot.chat_is_bound(OTHER_GID), "自动绑定关闭时普通聊天不会自动绑定")
+        # 未绑定群里发别的指令应保持安静（不刷屏）
+        n0 = len(bot.tg.sent)
+        bot.on_message({"chat": {"id": OTHER_GID, "type": "supergroup", "title": "第三个群"},
+                        "from": {"id": admin_uid, "first_name": "Boss"}, "message_id": 902,
+                        "text": "/top"})
+        check(len(bot.tg.sent) == n0, "未绑定群里无关指令保持静默")
+
         print()
         if FAILURES:
             print(f"❌ {len(FAILURES)} 项失败：")

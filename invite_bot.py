@@ -42,7 +42,7 @@ import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 BOT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG_PATH = os.path.join(BOT_DIR, "config.json")
 
@@ -2060,6 +2060,7 @@ class InviteBot:
         chat_type = chat.get("type")
         if user and not user.get("is_bot"):
             self.db.touch_user(user)
+        unbound = False
         if chat_type in ("group", "supergroup"):
             if not self.chat_is_bound(chat["id"]):
                 # 自动绑定：机器人被拉进新群/设为管理员就自动接入（多群）
@@ -2069,9 +2070,11 @@ class InviteBot:
                                detail=chat.get("title") or "")
                     log(f"自动绑定群：{chat.get('title')} ({chat['id']})")
                 else:
-                    return
-            # 活跃度统计（只记数量和时间，不存内容；机器人消息不计）
-            if (not text.startswith("/")) and user and not user.get("is_bot") \
+                    # 关掉自动绑定 ≠ 手动绑定也失效：
+                    # 这里只标记"未绑定"，稍后仍放行 /bind 等管理指令（否则群里发什么都没反应）
+                    unbound = True
+            # 活跃度统计（只记数量和时间，不存内容；机器人消息不计；未绑定的群不统计）
+            if (not unbound) and (not text.startswith("/")) and user and not user.get("is_bot") \
                     and self.setting("activity_enabled", True):
                 self.db.bump_activity(chat["id"], user["id"], msg.get("date"))
         if not text.startswith("/"):
@@ -2084,6 +2087,10 @@ class InviteBot:
             return
         args = text.split()
         cmd = args[0].split("@")[0].lower()
+        # 未绑定的群：只放行绑定/帮助类指令，避免机器人在没接入的群里乱回复
+        if unbound and cmd not in ("/bind", "/unbind", "/groupinfo", "/groups",
+                                   "/start", "/help", "/manage"):
+            return
         self.dispatch_command(cmd, args[1:], msg)
 
     def reply(self, msg: dict, text: str, **kw):
@@ -3070,8 +3077,9 @@ class InviteBot:
                 self.reply(msg, "请在群里发这条命令，或用 <code>/bind -1001234567890</code> 指定群。")
             return
         uid = msg["from"]["id"]
-        if not self.is_admin(uid):
-            self.reply(msg, "只有机器人管理员可以绑定群组。")
+        if not self.is_admin(uid) and not self.is_manager_for(uid, chat["id"]):
+            self.reply(msg, "只有<b>机器人管理员</b>或<b>本群管理员</b>可以绑定群组。\n"
+                            "如果你是本群管理员，请先把我设为群管理员（勾选「邀请用户」），再发一次 /bind。")
             return
         self.db.bind_chat(chat["id"], chat.get("title") or str(chat["id"]))
         self.db.event("bind", chat["id"], uid)

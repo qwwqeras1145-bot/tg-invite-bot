@@ -28,6 +28,7 @@ import html
 import io
 import json
 import os
+import queue
 import re
 import signal
 import sqlite3
@@ -42,7 +43,7 @@ import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "1.6.1"
+VERSION = "1.6.2"
 BOT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG_PATH = os.path.join(BOT_DIR, "config.json")
 
@@ -1942,6 +1943,12 @@ class InviteBot:
         self.start_web_panel()
         offset = self.db.get_offset()
         last_tick = 0.0
+        # 更新队列：轮询线程只负责"收"，处理放到独立线程串行执行。
+        # 以前是所有处理都在轮询线程里同步跑（申请审批里还有 sleep/API 调用），
+        # 一大波入群申请就能把机器人卡住几十秒 —— 这就是"卡卡的"的来源。
+        upd_q: queue.Queue = queue.Queue()
+        threading.Thread(target=self._update_worker, args=(upd_q,), daemon=True,
+                         name="update-worker").start()
         while self._running:
             try:
                 updates = self.tg.get_updates(offset, timeout=int(self.cfg.get("poll_timeout", 50)))
@@ -1955,18 +1962,13 @@ class InviteBot:
                 continue
             except Exception as e:
                 log(f"getUpdates 网络异常：{e}", "ERROR")
-                time.sleep(5)
+                time.sleep(2)
                 continue
             for upd in updates:
                 new_offset = int(upd["update_id"]) + 1
-                try:
-                    self.handle_update(upd)
-                except TelegramError as e:
-                    log(f"处理更新 {upd['update_id']} 时 API 报错：{e}", "ERROR")
-                except Exception:
-                    log("处理更新异常：\n" + traceback.format_exc(), "ERROR")
                 offset = new_offset
                 self.db.set_offset(offset)
+                upd_q.put(upd)
             # 每分钟跑一次后台任务（心跳 / 自动备份 / 周报）
             if time.time() - last_tick > 60:
                 last_tick = time.time()
@@ -2051,6 +2053,26 @@ class InviteBot:
             self.on_join_request(upd["chat_join_request"])
         elif "my_chat_member" in upd:
             self.on_my_chat_member(upd["my_chat_member"])
+
+    def _update_worker(self, q: queue.Queue) -> None:
+        """串行处理更新（保持顺序），但和轮询线程解耦：
+        处理再慢也不会影响下一次 getUpdates，机器人不会"卡住不响应"。"""
+        while True:
+            try:
+                upd = q.get()
+            except Exception:
+                return
+            try:
+                self.handle_update(upd)
+            except TelegramError as e:
+                log(f"处理更新 {upd.get('update_id')} 时 API 报错：{e}", "ERROR")
+            except Exception:
+                log("处理更新异常：\n" + traceback.format_exc(), "ERROR")
+            finally:
+                try:
+                    q.task_done()
+                except Exception:
+                    pass
 
     # -- 消息 -------------------------------------------------------------
     def on_message(self, msg: dict) -> None:

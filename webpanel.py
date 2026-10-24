@@ -81,7 +81,7 @@ except Exception:  # pragma: no cover
 
     PBKDF2_ITER = 600_000
 
-VERSION = "1.6.1"
+VERSION = "1.6.2"
 SESSION_COOKIE = "dshb_sess"
 TWOFA_COOKIE = "dshb_2fa"
 SESSION_TTL = 12 * 3600          # 会话 12 小时过期（原来 7 天，缩短以降低被盗用风险）
@@ -787,8 +787,21 @@ class WebPanel(threading.Thread):
 
     def run(self) -> None:
         handler = _make_handler(self)
+        cert, key = self.cfg.get("web_tls_cert"), self.cfg.get("web_tls_key")
+        use_tls = bool(cert and key and os.path.exists(cert) and os.path.exists(key))
         try:
-            self._server = ThreadingHTTPServer((self.bind_host, self.port), handler)
+            if use_tls:
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                try:
+                    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+                except Exception:
+                    pass
+                ctx.load_cert_chain(cert, key)
+                ctx.sni_callback = self._sni_callback
+                # 握手在每连接线程里做（见 _TLSThreadingServer 说明），不会卡死 accept
+                self._server = _TLSThreadingServer((self.bind_host, self.port), handler, ctx)
+            else:
+                self._server = ThreadingHTTPServer((self.bind_host, self.port), handler)
         except OSError as e:
             self.log(f"网页后台启动失败（端口 {self.port}）：{e}", "ERROR")
             return
@@ -796,13 +809,7 @@ class WebPanel(threading.Thread):
         self.ready = True
         self.allowed_hosts = self._allowed_hosts()
         self._sni_seen: dict = {}
-        cert, key = self.cfg.get("web_tls_cert"), self.cfg.get("web_tls_key")
-        if cert and key and os.path.exists(cert) and os.path.exists(key):
-            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-            ctx.load_cert_chain(cert, key)
-            # 只接受白名单 SNI：拿 IP 扫描的人连握手都过不去，拿不到任何内容
-            ctx.sni_callback = self._sni_callback
-            self._server.socket = ctx.wrap_socket(self._server.socket, server_side=True)
+        if use_tls:
             self.log(f"网页后台已启动（HTTPS）：{self.base_url}，SNI 白名单：{sorted(self.allowed_hosts)}")
         else:
             self.log(f"网页后台已启动：{self.base_url}"
@@ -3843,10 +3850,57 @@ class WebPanel(threading.Thread):
         self._send(h, 200, data, "image/svg+xml; charset=utf-8")
 
 
+class _TLSThreadingServer(ThreadingHTTPServer):
+    """每个连接都在独立线程里完成 TLS 握手。
+
+    旧实现直接 `ctx.wrap_socket(监听socket, server_side=True)`：
+    SSLSocket.accept() 会在**接收连接的主线程**里同步做握手，
+    任何半开连接 / 慢网络 / 扫描器连上后不发数据，整个 accept 循环就被卡死
+    （现象：服务进程还在、端口在 LISTEN、Recv-Q 堆积、网站 000 打不开）。
+
+    现在：监听 socket 保持明文，握手放到每个连接自己的线程里并加 15 秒超时，
+    坏连接最多浪费一个线程，绝不会再拖死整个网页服务。
+    """
+
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, addr, handler, tls_context):
+        self.tls_context = tls_context
+        super().__init__(addr, handler)
+
+    def process_request(self, request, client_address):
+        t = threading.Thread(target=self._tls_handle, args=(request, client_address),
+                             daemon=True)
+        t.start()
+
+    def _tls_handle(self, request, client_address):
+        tls = None
+        try:
+            request.settimeout(15)
+            tls = self.tls_context.wrap_socket(request, server_side=True)
+        except Exception:
+            try:
+                request.close()
+            except Exception:
+                pass
+            return
+        try:
+            self.finish_request(tls, client_address)
+        except Exception:
+            pass
+        finally:
+            try:
+                self.shutdown_request(tls)
+            except Exception:
+                pass
+
+
 def _make_handler(panel: "WebPanel"):
     class Handler(BaseHTTPRequestHandler):
         server_version = "xiyuer-bot-web"
         sys_version = ""
+        timeout = 30          # 读请求/保持连接的超时，防止半个连接长期占着线程
 
         def log_message(self, fmt, *args):
             return

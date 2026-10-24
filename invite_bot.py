@@ -1922,7 +1922,10 @@ class InviteBot:
     def run(self):
         log(f"机器人启动：@{self.bot_username} (id={self.bot_id}) v{VERSION}")
         self.db.set_kv("bot_started_at", str(int(time.time())))
-        # 记录隐私模式状态（活跃统计准不准就看这个）
+        # ★ 网页面板必须最先启动：网站不能因为 Telegram API 抽风/网络超时而打不开
+        #   （2026-10-24 事故：deleteWebhook 卡了 61 秒，网页排在它后面一直没起来 → 外网 521）
+        self.start_web_panel()
+        # 以下是"尽力而为"的 Telegram 初始化，失败/超时都不影响网站
         try:
             me = self.tg.get_me()
             if "can_read_all_group_messages" in me:
@@ -1931,16 +1934,18 @@ class InviteBot:
                                      else "开启中（只能统计命令/@消息，活跃数据会偏少）"))
         except TelegramError:
             pass
+        except Exception as e:
+            log(f"getMe 异常（忽略）：{e}", "WARN")
         try:
-            self.tg.call("deleteWebhook", {"drop_pending_updates": False}, retries=1)
-        except TelegramError as e:
-            log(f"deleteWebhook 失败（忽略）：{e}", "WARN")
+            self.tg.call("deleteWebhook", {"drop_pending_updates": False},
+                         timeout=10, retries=1)
+        except Exception as e:
+            log(f"deleteWebhook 失败（忽略，继续轮询）：{e}", "WARN")
         chats = self.db.active_chats()
         if chats:
             log("已绑定群：" + ", ".join(f"{c['title']}({c['chat_id']})" for c in chats))
         else:
             log("尚未绑定任何群：把机器人拉进群并设为管理员后，在群里发 /bind 即可", "WARN")
-        self.start_web_panel()
         offset = self.db.get_offset()
         last_tick = 0.0
         # 更新队列：轮询线程只负责"收"，处理放到独立线程串行执行。
@@ -1977,6 +1982,15 @@ class InviteBot:
                 except Exception:
                     log("定时任务异常：\n" + traceback.format_exc(), "ERROR")
         log("机器人已停止")
+        # 强制快速退出：线程池/网页线程里可能还有卡在网络上的任务，
+        # 不强制退出会让 systemd 等 60 秒后 SIGKILL（表现为"重启要等一分钟"，
+        # 而且旧进程占着 443 端口 → 新实例起不来，网站空窗）。
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+        os._exit(0)
 
     # -- 权限 -------------------------------------------------------------
     def is_admin(self, user_id: int) -> bool:
